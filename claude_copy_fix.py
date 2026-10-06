@@ -13,6 +13,7 @@ Claude (или на claude.ai в браузере), он берёт HTML-вер�
 Разовая правка:     python claude_copy_fix.py --once
 Проверка на файле:  python claude_copy_fix.py --test fragment.html
 """
+import html
 import re
 import sys
 import time
@@ -46,8 +47,24 @@ class HtmlToText(HTMLParser):
         self.skip = 0
         self.pre = 0
         self.cell_index = 0
+        # Параллельно собирается простой HTML: те же переносы (<br>), номера и маркеры
+        # текстом, плюс жирный/курсив. Telegram и мессенджеры берут из буфера HTML и
+        # склеивают абзацы <p> в сплошной текст, а <br> и <b> понимают.
+        self.hparts = []
+        self.bold = 0
+        self.ital = 0
 
     # --- вывод ---
+    def _h(self, s, raw=False):
+        e = html.escape(s, quote=False)
+        if raw:
+            e = e.replace("\n", "<br>")
+        if self.ital:
+            e = "<i>" + e + "</i>"
+        if self.bold:
+            e = "<b>" + e + "</b>"
+        self.hparts.append(e)
+
     def brk(self, level):
         self.pending = max(self.pending, level)
 
@@ -62,6 +79,7 @@ class HtmlToText(HTMLParser):
         if self.pending:
             if self.parts:
                 self.parts.append("\n" * self.pending)
+                self.hparts.append("<br>" * self.pending)
             self.pending = 0
         if line_start:
             prefix = self.line_prefix
@@ -69,8 +87,10 @@ class HtmlToText(HTMLParser):
                 prefix = self.li_stack[-1]["cont"]
             if prefix:
                 self.parts.append(prefix)
+                self.hparts.append(html.escape(prefix, quote=False).replace(" ", "&nbsp;"))
             self.line_prefix = ""
         self.parts.append(s)
+        self._h(s, raw=raw)
         if self.li_stack:
             self.li_stack[-1]["has_text"] = True
         self.at_line_start = s.endswith("\n")
@@ -83,7 +103,11 @@ class HtmlToText(HTMLParser):
         if self.skip:
             return
         a = dict(attrs)
-        if tag == "br":
+        if tag in ("strong", "b"):
+            self.bold += 1
+        elif tag in ("em", "i"):
+            self.ital += 1
+        elif tag == "br":
             if self.pre:
                 self.write("\n", raw=True)
             else:
@@ -144,7 +168,11 @@ class HtmlToText(HTMLParser):
             return
         if self.skip:
             return
-        if tag in ("ul", "ol"):
+        if tag in ("strong", "b"):
+            self.bold = max(self.bold - 1, 0)
+        elif tag in ("em", "i"):
+            self.ital = max(self.ital - 1, 0)
+        elif tag in ("ul", "ol"):
             if self.lists:
                 self.lists.pop()
             self.brk(1 if self.li_stack else 2)
@@ -184,6 +212,34 @@ def html_to_text(fragment):
     p.feed(fragment)
     p.close()
     return p.result()
+
+
+def html_to_simple_html(fragment):
+    """Тот же разбор, но результат — простой HTML: <br> вместо абзацев, номера
+    пунктов текстом, <b>/<i> сохранены. Его понимают и Word, и Telegram."""
+    p = HtmlToText()
+    p.feed(fragment)
+    p.close()
+    h = "".join(p.hparts)
+    h = re.sub(r"^(?:<br>)+|(?:<br>)+$", "", h)
+    h = re.sub(r"(?:<br>){3,}", "<br><br>", h)
+    return h
+
+
+def build_cf_html(fragment_html, source_url=""):
+    """Собрать формат 'HTML Format' (заголовок со смещениями + фрагмент)."""
+    head = ("Version:0.9\r\nStartHTML:{:010d}\r\nEndHTML:{:010d}\r\n"
+            "StartFragment:{:010d}\r\nEndFragment:{:010d}\r\n")
+    if source_url:
+        head += "SourceURL:" + source_url + "\r\n"
+    pre = "<html><body>\r\n<!--StartFragment-->"
+    post = "<!--EndFragment-->\r\n</body></html>"
+    frag = fragment_html.encode("utf-8")
+    h0 = len(head.format(0, 0, 0, 0).encode("ascii"))
+    sf = h0 + len(pre.encode("utf-8"))
+    ef = sf + len(frag)
+    eh = ef + len(post.encode("utf-8"))
+    return head.format(h0, eh, sf, ef).encode("ascii") + pre.encode("utf-8") + frag + post.encode("utf-8")
 
 
 def parse_cf_html(raw):
@@ -348,7 +404,10 @@ def process_once(force=False):
     new_text = html_to_text(frag)
     if not new_text.strip():
         return False
-    return write_clip(new_text, raw)
+    # HTML в буфере заменяем на упрощённый: с <br> и номерами пунктов текстом.
+    # Telegram и веб-чаты вставляют HTML и иначе склеивают абзацы; Word сохраняет жирный.
+    new_html = build_cf_html(html_to_simple_html(frag), url)
+    return write_clip(new_text, new_html)
 
 
 def run_loop():
